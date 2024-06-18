@@ -1,0 +1,376 @@
+diff --git a/llama/generation.py b/llama/generation.py
+index 3abd3ed..5582e06 100755
+--- a/llama/generation.py
++++ b/llama/generation.py
+@@ -30,6 +30,7 @@ class LLaMA:
+         min_prompt_size = min([len(t) for t in prompt_tokens])
+         max_prompt_size = max([len(t) for t in prompt_tokens])
+ 
++        assert min_prompt_size >= 6, "Min Prompt size should be 6"
+         total_len = min(params.max_seq_len, max_gen_len + max_prompt_size)
+ 
+         tokens = torch.full((bsz, total_len), self.tokenizer.pad_id).cuda().long()
+diff --git a/llama/model.py b/llama/model.py
+index baac760..e62b351 100755
+--- a/llama/model.py
++++ b/llama/model.py
+@@ -2,13 +2,16 @@
+ # This software may be used and distributed according to the terms of the GNU General Public License version 3.
+ 
+ from typing import Optional, Tuple
+-from dataclasses import dataclass
++from dataclasses import dataclass, field
+ import math
+ 
++import numpy as np
+ import torch
+ from torch import nn
+ import torch.nn.functional as F
+ 
++from scipy.spatial.distance import cdist
++from sklearn.cluster import AgglomerativeClustering
+ import fairscale.nn.model_parallel.initialize as fs_init
+ from fairscale.nn.model_parallel.layers import (
+     ParallelEmbedding,
+@@ -25,9 +28,53 @@ class ModelArgs:
+     vocab_size: int = -1  # defined later by tokenizer
+     multiple_of: int = 256  # make SwiGLU hidden layer size multiple of large power of 2
+     norm_eps: float = 1e-5
+-
+-    max_batch_size: int = 32
++    prune_layer: int = 32
++    max_batch_size: int = 1
+     max_seq_len: int = 2048
++    chai_activate: bool = True
++    chai_layers: list = field(
++        default_factory=lambda: [
++            28,
++            28,
++            28,
++            18,
++            18,
++            18,
++            18,
++            18,
++            18,
++            18,
++            18,
++            18,
++            18,
++            18,
++            18,
++            8,
++            8,
++            4,
++            4,
++            4,
++            4,
++            4,
++            4,
++            4,
++            4,
++            4,
++            4,
++            4,
++            4,
++            4,
++            4,
++            4,
++            4,
++            4,
++            4,
++            4,
++            4,
++            4,
++            4,
++        ]
++    )
+ 
+ 
+ class RMSNorm(torch.nn.Module):
+@@ -74,12 +121,17 @@ def apply_rotary_emb(
+ 
+ 
+ class Attention(nn.Module):
+-    def __init__(self, args: ModelArgs):
++    def __init__(self, layer_id: int, args: ModelArgs):
+         super().__init__()
+ 
+         self.n_local_heads = args.n_heads // fs_init.get_model_parallel_world_size()
+         self.head_dim = args.dim // args.n_heads
+ 
++        self.layer_id = layer_id
++        self.chai_activate = args.chai_activate
++        self.prune_layer = args.prune_layer
++        self.chai_layer_param = args.chai_layers[layer_id]
++
+         self.wq = ColumnParallelLinear(
+             args.dim,
+             args.n_heads * self.head_dim,
+@@ -109,6 +161,7 @@ class Attention(nn.Module):
+             init_method=lambda x: x,
+         )
+ 
++        # store the Query again
+         self.cache_k = torch.zeros(
+             (args.max_batch_size, args.max_seq_len, self.n_local_heads, self.head_dim)
+         ).cuda()
+@@ -116,7 +169,16 @@ class Attention(nn.Module):
+             (args.max_batch_size, args.max_seq_len, self.n_local_heads, self.head_dim)
+         ).cuda()
+ 
+-    def forward(self, x: torch.Tensor, start_pos: int, freqs_cis: torch.Tensor, mask: Optional[torch.Tensor]):
++    def forward(
++        self,
++        x: torch.Tensor,
++        start_pos: int,
++        freqs_cis: torch.Tensor,
++        mask: Optional[torch.Tensor],
++    ):
++
++        # NOTE: The first sequence needs to be atleast of size 6
++        # if not we throw an error.
+         bsz, seqlen, _ = x.shape
+         xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
+ 
+@@ -128,26 +190,163 @@ class Attention(nn.Module):
+ 
+         self.cache_k = self.cache_k.to(xq)
+         self.cache_v = self.cache_v.to(xq)
+-
+         self.cache_k[:bsz, start_pos : start_pos + seqlen] = xk
+         self.cache_v[:bsz, start_pos : start_pos + seqlen] = xv
+ 
+-        keys = self.cache_k[:bsz, : start_pos + seqlen]
+-        values = self.cache_v[:bsz, : start_pos + seqlen]
+-
+-        xq = xq.transpose(1, 2)
+-        keys = keys.transpose(1, 2)
+-        values = values.transpose(1, 2)
+-        scores = torch.matmul(xq, keys.transpose(2, 3)) / math.sqrt(self.head_dim)
+-        if mask is not None:
+-            scores = scores + mask  # (bs, n_local_heads, slen, cache_len + slen)
+-        scores = F.softmax(scores.float(), dim=-1).type_as(xq)
+-        output = torch.matmul(scores, values)  # (bs, n_local_heads, slen, head_dim)
+-        output = output.transpose(
+-            1, 2
+-        ).contiguous().view(bsz, seqlen, -1)
+-
+-        return self.wo(output)
++        cluster_assignment_log_per_example = dict()
++        if self.layer_id >= self.prune_layer:
++            # CHAI
++            if start_pos == 0:
++                # first sentence
++
++                xk = self.cache_k[:bsz, : start_pos + seqlen]
++                values = self.cache_v[:bsz, : start_pos + seqlen]
++                xq = xq.view(bsz, self.n_local_heads, seqlen, self.head_dim)
++                xk = xk.view(bsz, self.n_local_heads, seqlen, self.head_dim)
++                num_examples, num_org_heads, seq_len, head_dim = xq.shape
++                xq_four = xq[:, :, :5, :]
++                xk_four = xk[:, :, :5, :]
++
++                scores_four = F.softmax(
++                    (
++                        torch.matmul(xq_four, xk_four.transpose(2, 3))
++                        / math.sqrt(self.head_dim)
++                    ).float(),
++                    dim=-1,
++                )
++                scores_four_numpy = scores_four.cpu().numpy()
++                scores_new_xk_xq = torch.zeros(
++                    [num_examples, num_org_heads, seq_len, seq_len],
++                    device=xq.device,
++                    dtype=xq.dtype,
++                )
++                xk_new = torch.zeros(
++                    [num_examples, self.chai_layer_param, seq_len, head_dim],
++                    dtype=xk.dtype,
++                    device=xk.device,
++                )
++                xq_new = torch.zeros(
++                    [num_examples, self.chai_layer_param, seq_len, head_dim],
++                    dtype=xq.dtype,
++                    device=xq.device,
++                )
++
++                for ex_id in range(num_examples):
++                    assert num_examples == 1
++                    temp_data = dict()
++                    ex_id_score = scores_four_numpy[ex_id, :]
++                    sequence_length_example = ex_id_score.shape[1]
++                    # if ex_id_score.shape[1] > 4:
++                    # use_small = False
++                    num_heads = ex_id_score.shape[0]
++                    first_sample_score = ex_id_score.reshape((num_heads, -1))
++                    dist_arr = cdist(
++                        first_sample_score, first_sample_score, metric="cosine"
++                    )
++                    cluster = AgglomerativeClustering(
++                        n_clusters=self.chai_layer_param,
++                        metric="precomputed",
++                        linkage="average",
++                    )
++                    try:
++                        cluster = cluster.fit(dist_arr)
++                    except:
++                        import ipdb
++
++                        ipdb.set_trace()
++                    cluster_assignment = cluster.labels_
++                    self.grouping = cluster_assignment
++                    for cluster_idx in range(self.chai_layer_param):
++                        grouped_heads = np.where(cluster_assignment == cluster_idx)[
++                            0
++                        ].tolist()
++                        xk_new[ex_id, cluster_idx, :, :] = xk[
++                            ex_id, grouped_heads[0], :, :
++                        ]
++                        xq_new[ex_id, cluster_idx, :, :] = xq[
++                            ex_id, grouped_heads[0], :, :
++                        ]
++                        temp_data[cluster_idx] = grouped_heads
++                    cluster_assignment_log_per_example[ex_id] = temp_data
++                    # else:
++                    # cluster_assignment_log_per_example[ex_id] = temp_data
++                    # xk_new = xk
++                    # xq_new = xq
++            else:
++                # scores
++                xk = self.cache_k[:bsz, : start_pos + seqlen]
++                values = self.cache_v[:bsz, : start_pos + seqlen]
++                xq = xq.view(bsz, self.n_local_heads, 1, self.head_dim)
++                xk = xk.view(bsz, self.n_local_heads, start_pos + seqlen, self.head_dim)
++                num_examples, num_org_heads, seq_len, head_dim = xk.shape
++                scores_new_xk_xq = torch.zeros(
++                    [num_examples, num_org_heads, 1, seq_len],
++                    device=xq.device,
++                    dtype=xq.dtype,
++                )
++                xk_new = torch.zeros(
++                    [num_examples, self.chai_layer_param, seq_len, head_dim],
++                    dtype=xk.dtype,
++                    device=xk.device,
++                )
++                xq_new = torch.zeros(
++                    [num_examples, self.chai_layer_param, 1, head_dim],
++                    dtype=xq.dtype,
++                    device=xq.device,
++                )
++                cluster_assignment = self.grouping
++                for ex_id in range(num_examples):
++                    temp_data = dict()
++                    for cluster_idx in range(self.chai_layer_param):
++                        grouped_heads = np.where(cluster_assignment == cluster_idx)[
++                            0
++                        ].tolist()
++                        xk_new[ex_id, cluster_idx, :, :] = xk[
++                            ex_id, grouped_heads[0], :, :
++                        ]
++                        xq_new[ex_id, cluster_idx, :, :] = xq[
++                            ex_id, grouped_heads[0], :, :
++                        ]
++                        temp_data[cluster_idx] = grouped_heads
++                    cluster_assignment_log_per_example[ex_id] = temp_data
++
++            scores_new_temp = torch.matmul(xq_new, xk_new.transpose(2, 3)) / math.sqrt(
++                self.head_dim
++            )
++            # if use_small:
++            # putting them back together
++            for ex_id in range(num_examples):
++                for cluster_idx in range(self.chai_layer_param):
++                    scores_new_xk_xq[
++                        ex_id,
++                        cluster_assignment_log_per_example[ex_id][cluster_idx],
++                        :,
++                        :,
++                    ] = scores_new_temp[ex_id, cluster_idx, :, :]
++            # else:
++            # scores_new_xk_xq = scores_new_temp
++            if mask is not None:
++                scores_new_xk_xq = scores_new_xk_xq + mask
++            scores_new_xk_xq = F.softmax(scores_new_xk_xq.float(), dim=-1).type_as(xq)
++            scores = scores_new_xk_xq
++            values = values.transpose(1, 2)
++            output = torch.matmul(scores, values)  # (bs, n_local_heads, slen, head_dim)
++            output = output.transpose(1, 2).contiguous().view(bsz, seqlen, -1)
++            return self.wo(output)
++        else:
++            keys = self.cache_k[:bsz, : start_pos + seqlen]
++            values = self.cache_v[:bsz, : start_pos + seqlen]
++
++            xq = xq.transpose(1, 2)
++            keys = keys.transpose(1, 2)
++            values = values.transpose(1, 2)
++            scores = torch.matmul(xq, keys.transpose(2, 3)) / math.sqrt(self.head_dim)
++            if mask is not None:
++                scores = scores + mask  # (bs, n_local_heads, slen, cache_len + slen)
++            scores = F.softmax(scores.float(), dim=-1).type_as(xq)
++            output = torch.matmul(scores, values)  # (bs, n_local_heads, slen, head_dim)
++            output = output.transpose(1, 2).contiguous().view(bsz, seqlen, -1)
++            return self.wo(output)
+ 
+ 
+ class FeedForward(nn.Module):
+@@ -181,16 +380,27 @@ class TransformerBlock(nn.Module):
+         self.n_heads = args.n_heads
+         self.dim = args.dim
+         self.head_dim = args.dim // args.n_heads
+-        self.attention = Attention(args)
++        self.attention = Attention(layer_id, args)
+         self.feed_forward = FeedForward(
+             dim=args.dim, hidden_dim=4 * args.dim, multiple_of=args.multiple_of
+         )
+         self.layer_id = layer_id
++        self.chai_activate = args.chai_activate
++        self.prune_layer = args.prune_layer
++        self.chai_layer_param = args.chai_layers[layer_id]
+         self.attention_norm = RMSNorm(args.dim, eps=args.norm_eps)
+         self.ffn_norm = RMSNorm(args.dim, eps=args.norm_eps)
+ 
+-    def forward(self, x: torch.Tensor, start_pos: int, freqs_cis: torch.Tensor, mask: Optional[torch.Tensor]):
+-        h = x + self.attention.forward(self.attention_norm(x), start_pos, freqs_cis, mask)
++    def forward(
++        self,
++        x: torch.Tensor,
++        start_pos: int,
++        freqs_cis: torch.Tensor,
++        mask: Optional[torch.Tensor],
++    ):
++        h = x + self.attention.forward(
++            self.attention_norm(x), start_pos, freqs_cis, mask
++        )
+         out = h + self.feed_forward.forward(self.ffn_norm(h))
+         return out
+ 
+@@ -207,8 +417,16 @@ class Transformer(nn.Module):
+         )
+ 
+         self.layers = torch.nn.ModuleList()
++        self.prune_layer = params.prune_layer
++        self.chai_activate = params.chai_activate
++        self.chai_layers = params.chai_layers
+         for layer_id in range(params.n_layers):
+-            self.layers.append(TransformerBlock(layer_id, params))
++            self.layers.append(
++                TransformerBlock(
++                    layer_id,
++                    params,
++                )
++            )
+ 
+         self.norm = RMSNorm(params.dim, eps=params.norm_eps)
+         self.output = ColumnParallelLinear(
+@@ -228,7 +446,9 @@ class Transformer(nn.Module):
+ 
+         mask = None
+         if seqlen > 1:
+-            mask = torch.full((1, 1, seqlen, seqlen), float("-inf"), device=tokens.device)
++            mask = torch.full(
++                (1, 1, seqlen, seqlen), float("-inf"), device=tokens.device
++            )
+             mask = torch.triu(mask, diagonal=start_pos + 1).type_as(h)
+ 
+         for layer in self.layers:

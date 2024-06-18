@@ -1,0 +1,4 @@
+[submodule "llama"]
+	path = llama
+    url = git@github.com:meta-llama/llama.git
+    branch = llama_v1
